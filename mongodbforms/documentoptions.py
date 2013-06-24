@@ -2,10 +2,15 @@ import sys
 from collections import MutableMapping
 
 from django.db.models.fields import FieldDoesNotExist
-from django.db.models.options import get_verbose_name
 from django.utils.text import capfirst
+from django.db.models.options import get_verbose_name
 
 from mongoengine.fields import ReferenceField
+
+def create_verbose_name(name):
+    name = get_verbose_name(name)
+    name.replace('_', ' ')
+    return name
 
 class PkWrapper(object):
     def __init__(self, wrapped):
@@ -39,9 +44,13 @@ class DocumentMetaWrapper(MutableMapping):
     _field_cache = None
     document = None
     _meta = None
+    concrete_model = None
     
     def __init__(self, document):
         self.document = document
+        # used by Django to distinguish between abstract and concrete models
+        # here for now always the document
+        self.concrete_model = document
         self._meta = getattr(document, '_meta', {})
         
         try:
@@ -75,9 +84,9 @@ class DocumentMetaWrapper(MutableMapping):
         """
         if self._verbose_name is None:
             try:
-                self._verbose_name = capfirst(get_verbose_name(self._meta['verbose_name']))
+                self._verbose_name = capfirst(create_verbose_name(self._meta['verbose_name']))
             except KeyError:
-                self._verbose_name = capfirst(get_verbose_name(self.object_name))
+                self._verbose_name = capfirst(create_verbose_name(self.object_name))
                 
         return self._verbose_name
     
@@ -160,7 +169,23 @@ class DocumentMetaWrapper(MutableMapping):
         if self._field_cache is None:
             self._field_cache = {}
         
-        for f in self.document._fields.itervalues():
+        for f in self.document._fields.values():
+            # Yay, more glue. Django expects fields to have a rel attribute
+            # at least in the admin, probably in more places. So we add them here
+            # and hope that this is the common path to access the fields.
+            if not hasattr(f, 'rel'):
+                f.rel = None
+            if getattr(f, 'verbose_name', None) is None:
+                f.verbose_name = capfirst(create_verbose_name(f.name))
+            if not hasattr(f, 'flatchoices'):
+                flat = []
+                if f.choices is not None:
+                    for choice, value in f.choices:
+                        if isinstance(value, (list, tuple)):
+                            flat.extend(value)
+                        else:
+                            flat.append((choice,value))
+                f.flatchoices = flat
             if isinstance(f, ReferenceField):
                 document = f.document_type
                 document._meta = DocumentMetaWrapper(document)
@@ -201,9 +226,6 @@ class DocumentMetaWrapper(MutableMapping):
     def __delitem__(self, key):
         return self._meta.__delitem__(key)
 
-    def __contains__(self, key):
-        return key in self._meta
-
     def __iter__(self):
         return self._meta.__iter__()
 
@@ -223,4 +245,4 @@ class DocumentMetaWrapper(MutableMapping):
         return []
 
     def iteritems(self):
-        return self._meta.iteritems()
+        return iter(self._meta.items())

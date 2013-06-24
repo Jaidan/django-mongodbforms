@@ -1,9 +1,8 @@
 import os
 import itertools
-import gridfs
+from collections import Callable
 
 from django.utils.datastructures import SortedDict
-
 from django.forms.forms import BaseForm, get_declared_fields, NON_FIELD_ERRORS, pretty_name
 from django.forms.widgets import media_property
 from django.core.exceptions import FieldError
@@ -13,22 +12,82 @@ from django.forms.formsets import BaseFormSet, formset_factory
 from django.utils.translation import ugettext_lazy as _, ugettext
 from django.utils.text import capfirst
 
-from mongoengine.fields import ObjectIdField, ListField, ReferenceField, FileField, ImageField
-from mongoengine.base import ValidationError
+from mongoengine.fields import ObjectIdField, ListField, ReferenceField, FileField, MapField
+try:
+    from mongoengine.base import ValidationError
+except ImportError:
+    from mongoengine.errors import ValidationError
+from mongoengine.queryset import OperationError
 from mongoengine.connection import _get_db
+from gridfs import GridFS
 
-from fieldgenerator import MongoDefaultFormFieldGenerator
-from documentoptions import DocumentMetaWrapper
+from .fieldgenerator import MongoDefaultFormFieldGenerator
+from .documentoptions import DocumentMetaWrapper
+from .util import with_metaclass
 
 
 def _get_unique_filename(name):
-    fs = gridfs.GridFS(_get_db())
+    fs = GridFS(_get_db())
     file_root, file_ext = os.path.splitext(name)
     count = itertools.count(1)
     while fs.exists(filename=name):
         # file_ext includes the dot.
-        name = os.path.join("%s_%s%s" % (file_root, count.next(), file_ext))
+        name = os.path.join("%s_%s%s" % (file_root, next(count), file_ext))
     return name
+
+# The awesome Mongoengine ImageGridFsProxy wants to pull a field
+# from a document to get necessary data. Trouble is that this doesn't work
+# if the ImageField is stored on List or MapField. So we pass a nice fake
+# document to the proxy to get saving the file done. Yeah it really is that ugly.
+class FakeDocument(object):
+    _fields = {}
+    
+    def __init__(self, key, field):
+        super(FakeDocument, self).__init__()
+        
+        self._fields[key] = field
+    
+    # We don't care if anything gets marked on this
+    # we do update a real field later though. That should
+    # trigger the same thing on the real document.
+    def _mark_as_changed(self, key):
+        pass
+    
+def _save_iterator_file(field, uploaded_file, file_data=None):
+    """
+    Takes care of saving a file for a list field. Returns a Mongoengine
+    fileproxy object or the file field.
+    """
+    fake_document = FakeDocument(field.name, field.field)
+    overwrote_instance = False
+    overwrote_key = False
+    # for a new file we need a new proxy object
+    if file_data is None:
+        file_data = field.field.proxy_class(db_alias=field.field.db_alias,
+                            collection_name=field.field.collection_name)
+    
+    # overwrite an existing file
+    if file_data.instance is None:
+        file_data.instance = fake_document
+        overwrote_instance = True
+    if file_data.key is None:
+        file_data.key = field.name
+        overwrote_key = True
+    
+    if file_data.grid_id:
+        file_data.delete()
+        
+    uploaded_file.seek(0)
+    filename = _get_unique_filename(uploaded_file.name)
+    file_data.put(uploaded_file, content_type=uploaded_file.content_type, filename=filename)
+    file_data.close()
+    
+    if overwrote_instance:
+        file_data.instance = None
+    if overwrote_key:
+        file_data.key = None
+        
+    return file_data
 
 def construct_instance(form, instance, fields=None, exclude=None, ignore=None):
     """
@@ -43,7 +102,7 @@ def construct_instance(form, instance, fields=None, exclude=None, ignore=None):
     if isinstance(instance, type):
         instance = instance()
         
-    for f in instance._fields.itervalues():
+    for f in instance._fields.values():
         if isinstance(f, ObjectIdField):
             continue
         if not f.name in cleaned_data:
@@ -54,26 +113,49 @@ def construct_instance(form, instance, fields=None, exclude=None, ignore=None):
             continue
         # Defer saving file-type fields until after the other fields, so a
         # callable upload_to can use the values from other fields.
-        if isinstance(f, FileField) or isinstance(f, ImageField):
+        if isinstance(f, FileField) or (isinstance(f, (MapField, ListField)) and isinstance(f.field, FileField)):
             file_field_list.append(f)
         else:
-            setattr(instance, f.name, cleaned_data[f.name])
+            setattr(instance, f.name, cleaned_data.get(f.name))
 
     for f in file_field_list:
-        upload = cleaned_data[f.name]
-        if upload is None:
-            continue
-        field = getattr(instance, f.name)
-        try:
-            upload.file.seek(0)
-            filename = _get_unique_filename(upload.name)
-            field.replace(upload, content_type=upload.content_type, filename=filename)
-            setattr(instance, f.name, field)
-        except AttributeError:
-            # file was already uploaded and not changed during edit.
-            # upload is already the gridfsproxy object we need.
-            upload.get()
-            setattr(instance, f.name, upload)
+        if isinstance(f, MapField):
+            map_field = getattr(instance, f.name)
+            uploads = cleaned_data[f.name]
+            for key, uploaded_file in uploads.items():
+                if uploaded_file is None:
+                    continue
+                file_data = map_field.get(key, None)
+                map_field[key] = _save_iterator_file(f, uploaded_file, file_data)
+            setattr(instance, f.name, map_field)
+        elif isinstance(f, ListField):
+            list_field = getattr(instance, f.name)
+            uploads = cleaned_data[f.name]
+            for i, uploaded_file in enumerate(uploads):
+                if uploaded_file is None:
+                    continue
+                try:
+                    file_data = list_field[i]
+                except IndexError:
+                    file_data = None
+                map_field[i] = _save_iterator_file(f, uploaded_file, file_data)
+            setattr(instance, f.name, list_field)
+        else:
+            field = getattr(instance, f.name)
+            upload = cleaned_data[f.name]
+            if upload is None:
+                continue
+            
+            try:
+                upload.file.seek(0)
+                filename = _get_unique_filename(upload.name)
+                field.replace(upload, content_type=upload.content_type, filename=filename)
+                setattr(instance, f.name, field)
+            except AttributeError:
+                # file was already uploaded and not changed during edit.
+                # upload is already the gridfsproxy object we need.
+                upload.get()
+                setattr(instance, f.name, upload)
             
     return instance
 
@@ -97,14 +179,17 @@ def save_instance(form, instance, fields=None, fail_message='saved',
     if commit and hasattr(instance, 'save'):
         # see BaseDocumentForm._post_clean for an explanation
         if hasattr(form, '_delete_before_save'):
-            fields = instance._fields
-            new_fields = dict([(n, f) for n, f in fields.iteritems() if not n in form._delete_before_save])
+            data = instance._data
+            new_data = dict([(n, f) for n, f in data.items() if not n in form._delete_before_save])
             if hasattr(instance, '_changed_fields'):
                 for field in form._delete_before_save:
-                    instance._changed_fields.remove(field)
-            instance._fields = new_fields
+                    try:
+                        instance._changed_fields.remove(field)
+                    except ValueError:
+                        pass
+            instance._data = new_data
             instance.save()
-            instance._fields = fields
+            instance._data = data
         else:
             instance.save()
         
@@ -123,7 +208,7 @@ def document_to_dict(instance, fields=None, exclude=None):
     the ``fields`` argument.
     """
     data = {}
-    for f in instance._fields.itervalues():
+    for f in instance._fields.values():
         if fields and not f.name in fields:
             continue
         if exclude and f.name in exclude:
@@ -153,12 +238,12 @@ def fields_for_document(document, fields=None, exclude=None, widgets=None, \
     # they were defined on he document (at least with cPython) and I can't see 
     # any other way for now. Oh, yeah, it works because we sort on the memory address
     # and hope that the earlier fields have a lower address.
-    sorted_fields = sorted(document._fields.values(), key=lambda field: field.__hash__())
+    sorted_fields = sorted(list(document._fields.values()), key=lambda field: field.__hash__())
     
     for f in sorted_fields:
         if isinstance(f, ObjectIdField):
             continue
-        if isinstance(f, ListField) and not (f.field.choices or isinstance(f.field, ReferenceField)):
+        if isinstance(f, ListField) and not (hasattr(f.field,'choices') or isinstance(f.field, ReferenceField)):
             continue
         if fields is not None and not f.name in fields:
             continue
@@ -171,7 +256,7 @@ def fields_for_document(document, fields=None, exclude=None, widgets=None, \
 
         if formfield_callback is None:
             formfield = field_generator.generate(f, **kwargs)
-        elif not callable(formfield_callback):
+        elif not isinstance(formfield_callback, Callable):
             raise TypeError('formfield_callback must be a function or callable')
         else:
             formfield = formfield_callback(f, **kwargs)
@@ -193,7 +278,11 @@ def fields_for_document(document, fields=None, exclude=None, widgets=None, \
 
 class ModelFormOptions(object):
     def __init__(self, options=None):
+        # document class can be declared with 'document =' or 'model ='
         self.document = getattr(options, 'document', None)
+        if self.document is None:
+            self.document = getattr(options, 'model', None)
+            
         self.model = self.document
         meta = getattr(self.document, '_meta', {})
         # set up the document meta wrapper if document meta is a dict
@@ -231,7 +320,7 @@ class DocumentFormMetaclass(type):
             fields = fields_for_document(opts.document, opts.fields,
                             opts.exclude, opts.widgets, formfield_callback, formfield_generator)
             # make sure opts.fields doesn't specify an invalid field
-            none_document_fields = [k for k, v in fields.iteritems() if not v]
+            none_document_fields = [k for k, v in fields.items() if not v]
             missing_fields = set(none_document_fields) - \
                              set(declared_fields.keys())
             if missing_fields:
@@ -279,7 +368,7 @@ class BaseDocumentForm(BaseForm):
                                             error_class, label_suffix, empty_permitted)
 
     def _update_errors(self, message_dict):
-        for k, v in message_dict.items():
+        for k, v in list(message_dict.items()):
             if k != NON_FIELD_ERRORS:
                 self._errors.setdefault(k, self.error_class()).extend(v)
                 # Remove the data from the cleaned_data dict since it was invalid
@@ -298,7 +387,7 @@ class BaseDocumentForm(BaseForm):
         exclude = []
         # Build up a list of fields that should be excluded from model field
         # validation and unique checks.
-        for f in self.instance._fields.itervalues():
+        for f in self.instance._fields.values():
             field = f.name
             # Exclude fields that aren't on the form. The developer may be
             # adding these values to the model after form validation.
@@ -315,7 +404,7 @@ class BaseDocumentForm(BaseForm):
 
             # Exclude fields that failed form validation. There's no need for
             # the model fields to validate them as well.
-            elif field in self._errors.keys():
+            elif field in list(self._errors.keys()):
                 exclude.append(f.name)
 
             # Exclude empty fields that are not required by the form, if the
@@ -340,20 +429,19 @@ class BaseDocumentForm(BaseForm):
         self.instance = construct_instance(self, self.instance, opts.fields, opts.exclude)
 
         exclude = self._get_validation_exclusions()
-
         # Clean the model instance's fields.
         to_delete = []
         try:
-            for f in self.instance._fields.itervalues():
+            for f in self.instance._fields.values():
                 value = getattr(self.instance, f.name)
                 if f.name not in exclude:
                     f.validate(value)
-                elif value == '':
+                elif value in EMPTY_VALUES:
                     # mongoengine chokes on empty strings for fields
                     # that are not required. Clean them up here, though
                     # this is maybe not the right place :-)
                     to_delete.append(f.name)
-        except ValidationError, e:
+        except ValidationError as e:
             err = {f.name: [e.message]}
             self._update_errors(err)
         
@@ -369,7 +457,7 @@ class BaseDocumentForm(BaseForm):
         if hasattr(self.instance, 'clean'):
             try:
                 self.instance.clean()
-            except ValidationError, e:
+            except ValidationError as e:
                 self._update_errors({NON_FIELD_ERRORS: e.messages})
 
         # Validate uniqueness if needed.
@@ -379,24 +467,27 @@ class BaseDocumentForm(BaseForm):
     def validate_unique(self):
         """
         Validates unique constrains on the document.
-        unique_with is not checked at the moment.
+        unique_with is supported now.
         """
         errors = []
         exclude = self._get_validation_exclusions()
-        for f in self.instance._fields.itervalues():
+        for f in self.instance._fields.values():
             if f.unique and f.name not in exclude:
                 filter_kwargs = {
                     f.name: getattr(self.instance, f.name)
                 }
+                if f.unique_with:
+                    for u_with in f.unique_with:
+                        filter_kwargs[u_with] = getattr(self.instance, u_with)
                 qs = self.instance.__class__.objects().filter(**filter_kwargs)
                 # Exclude the current object from the query if we are editing an
                 # instance (as opposed to creating a new one)
                 if self.instance.pk is not None:
                     qs = qs.filter(pk__ne=self.instance.pk)
                 if len(qs) > 0:
-                    message = _(u"%(model_name)s with this %(field_label)s already exists.") %  {
-                                'model_name': unicode(capfirst(self.instance._meta.verbose_name)),
-                                'field_label': unicode(pretty_name(f.name))
+                    message = _("%(model_name)s with this %(field_label)s already exists.") %  {
+                                'model_name': str(capfirst(self.instance._meta.verbose_name)),
+                                'field_label': str(pretty_name(f.name))
                     }
                     err_dict = {f.name: [message]}
                     self._update_errors(err_dict)
@@ -427,8 +518,8 @@ class BaseDocumentForm(BaseForm):
         return obj
     save.alters_data = True
 
-class DocumentForm(BaseDocumentForm):
-    __metaclass__ = DocumentFormMetaclass
+class DocumentForm(with_metaclass(DocumentFormMetaclass, BaseDocumentForm)):
+    pass
     
 def documentform_factory(document, form=DocumentForm, fields=None, exclude=None,
                        formfield_callback=None):
@@ -462,28 +553,59 @@ def documentform_factory(document, form=DocumentForm, fields=None, exclude=None,
     return DocumentFormMetaclass(class_name, (form,), form_class_attrs)
 
 
-class EmbeddedDocumentForm(BaseDocumentForm):
-    __metaclass__ = DocumentFormMetaclass
-    
-    def __init__(self, parent_document, *args, **kwargs):
-        super(EmbeddedDocumentForm, self).__init__(*args, **kwargs)
-        self.parent_document = parent_document
-        if self._meta.embedded_field is not None and \
-                not hasattr(self.parent_document, self._meta.embedded_field):
+class EmbeddedDocumentForm(with_metaclass(DocumentFormMetaclass, BaseDocumentForm)):
+
+    def __init__(self, parent_document, instance=None, position=None, *args, **kwargs):
+        if self._meta.embedded_field is not None and not \
+                self._meta.embedded_field in parent_document._fields:
             raise FieldError("Parent document must have field %s" % self._meta.embedded_field)
         
+        if isinstance(parent_document._fields.get(self._meta.embedded_field), ListField):
+            # if we received a list position of the instance and no instance
+            # load the instance from the parent document and proceed as normal
+            if instance is None and position is not None:
+                instance = getattr(parent_document, self._meta.embedded_field)[position]
+            
+            # same as above only the other way around. Note: Mongoengine defines equality
+            # as having the same data, so if you have 2 objects with the same data the first
+            # one will be edited. That may or may not be the right one.
+            if instance is not None and position is None:
+                emb_list = getattr(parent_document, self._meta.embedded_field)
+                position = next((i for i, obj in enumerate(emb_list) if obj == instance), None)
+            
+        super(EmbeddedDocumentForm, self).__init__(instance=instance, *args, **kwargs)
+        self.parent_document = parent_document
+        self.position = position
+        
     def save(self, commit=True):
+        """If commit is True the embedded document is added to the parent
+        document. Otherwise the parent_document is left untouched and the
+        embedded is returned as usual.
+        """
         if self.errors:
             raise ValueError("The %s could not be saved because the data didn't"
                          " validate." % self.instance.__class__.__name__)
         
-        
         if commit:
-            l = getattr(self.parent_document, self._meta.embedded_field)
-            l.append(self.instance)
-            setattr(self.parent_document, self._meta.embedded_field, l)
-            self.parent_document.save() 
-        
+            field = self.parent_document._fields.get(self._meta.embedded_field)
+            if isinstance(field, ListField) and self.position is None:
+                # no position given, simply appending to ListField
+                try:
+                    self.parent_document.update(**{"push__" + self._meta.embedded_field: self.instance})
+                except:
+                    raise OperationError("The %s could not be appended." % self.instance.__class__.__name__)
+            elif isinstance(field, ListField) and self.position is not None:
+                # updating ListField at given position
+                try:
+                    self.parent_document.update(**{"__".join(("set", self._meta.embedded_field,
+                                                                str(self.position))): self.instance})
+                except:
+                    raise OperationError("The %s could not be updated at position "
+                                            "%d." % (self.instance.__class__.__name__, self.position))
+            else:
+                # not a listfield on parent, treat as an embedded field
+                setattr(self.parent_document, self._meta.embedded_field, self.instance)
+                self.parent_document.save() 
         return self.instance
 
 
@@ -534,15 +656,17 @@ class BaseDocumentFormSet(BaseFormSet):
             if not form.has_changed() and not form in self.initial_forms:
                 continue
             obj = self.save_object(form)
-            if form.cleaned_data["DELETE"]:
+            if form.cleaned_data.get("DELETE", False):
                 try:
                     obj.delete()
                 except AttributeError:
                     # if it has no delete method it is an 
                     # embedded object. We just don't add to the list
-                    # and it's gone. Cook huh?
+                    # and it's gone. Cool huh?
                     continue
-            saved.append(obj)
+            if commit:
+                obj.save()
+            saved.append(obj)    
         return saved
 
     def clean(self):
@@ -557,12 +681,13 @@ class BaseDocumentFormSet(BaseFormSet):
             
         if errors:
             raise ValidationError(errors)
+        
     def get_date_error_message(self, date_check):
         return ugettext("Please correct the duplicate data for %(field_name)s "
             "which must be unique for the %(lookup)s in %(date_field)s.") % {
             'field_name': date_check[2],
             'date_field': date_check[3],
-            'lookup': unicode(date_check[1]),
+            'lookup': str(date_check[1]),
         }
 
     def get_form_error(self):
@@ -582,6 +707,7 @@ def documentformset_factory(document, form=DocumentForm, formfield_callback=None
     FormSet.model = document
     FormSet.document = document
     return FormSet
+
 
 class BaseInlineDocumentFormSet(BaseDocumentFormSet):
     """
@@ -603,7 +729,7 @@ class BaseInlineDocumentFormSet(BaseDocumentFormSet):
 
     #@classmethod
     def get_default_prefix(cls):
-        return cls.model.__name__.lower()
+        return cls.document.__name__.lower()
     get_default_prefix = classmethod(get_default_prefix)
     
 
@@ -647,17 +773,220 @@ def inlineformset_factory(document, form=DocumentForm,
     FormSet = documentformset_factory(document, **kwargs)
     return FormSet
 
-class EmbeddedDocumentFormSet(BaseInlineDocumentFormSet):
-    def __init__(self, parent_document=None, data=None, files=None, instance=None,
-                 save_as_new=False, prefix=None, queryset=[], **kwargs):
+
+#class BaseInlineDocumentFormSet(BaseDocumentFormSet):
+#    """A formset for child objects related to a parent."""
+#    def __init__(self, data=None, files=None, instance=None,
+#                 save_as_new=False, prefix=None, queryset=None, **kwargs):
+#        if instance is None:
+#            self.instance = self.rel_field.name
+#        else:
+#            self.instance = instance
+#        self.save_as_new = save_as_new
+#        if queryset is None:
+#            queryset = self.model._default_manager
+#        if self.instance.pk:
+#            qs = queryset.filter(**{self.fk.name: self.instance})
+#        else:
+#            qs = queryset.none()
+#        super(BaseInlineDocumentFormSet, self).__init__(data, files, prefix=prefix,
+#                                                queryset=qs, **kwargs)
+#
+#    def initial_form_count(self):
+#        if self.save_as_new:
+#            return 0
+#        return super(BaseInlineDocumentFormSet, self).initial_form_count()
+#
+#
+#    def _construct_form(self, i, **kwargs):
+#        form = super(BaseInlineDocumentFormSet, self)._construct_form(i, **kwargs)
+#        if self.save_as_new:
+#            # Remove the primary key from the form's data, we are only
+#            # creating new instances
+#            form.data[form.add_prefix(self._pk_field.name)] = None
+#
+#            # Remove the foreign key from the form's data
+#            form.data[form.add_prefix(self.fk.name)] = None
+#
+#        # Set the fk value here so that the form can do its validation.
+#        setattr(form.instance, self.fk.get_attname(), self.instance.pk)
+#        return form
+#
+#    @classmethod
+#    def get_default_prefix(cls):
+#        from django.db.models.fields.related import RelatedObject
+#        return RelatedObject(cls.fk.rel.to, cls.model, cls.fk).get_accessor_name().replace('+','')
+#
+#    def save_new(self, form, commit=True):
+#        # Use commit=False so we can assign the parent key afterwards, then
+#        # save the object.
+#        obj = form.save(commit=False)
+#        pk_value = getattr(self.instance, self.fk.rel.field_name)
+#        setattr(obj, self.fk.get_attname(), getattr(pk_value, 'pk', pk_value))
+#        if commit:
+#            obj.save()
+#        # form.save_m2m() can be called via the formset later on if commit=False
+#        if commit and hasattr(form, 'save_m2m'):
+#            form.save_m2m()
+#        return obj
+#
+#    def add_fields(self, form, index):
+#        super(BaseInlineDocumentFormSet, self).add_fields(form, index)
+#        if self._pk_field == self.fk:
+#            name = self._pk_field.name
+#            kwargs = {'pk_field': True}
+#        else:
+#            # The foreign key field might not be on the form, so we poke at the
+#            # Model field to get the label, since we need that for error messages.
+#            name = self.fk.name
+#            kwargs = {
+#                'label': getattr(form.fields.get(name), 'label', capfirst(self.fk.verbose_name))
+#            }
+#            if self.fk.rel.field_name != self.fk.rel.to._meta.pk.name:
+#                kwargs['to_field'] = self.fk.rel.field_name
+#
+#        form.fields[name] = InlineForeignKeyField(self.instance, **kwargs)
+#
+#        # Add the generated field to form._meta.fields if it's defined to make
+#        # sure validation isn't skipped on that field.
+#        if form._meta.fields:
+#            if isinstance(form._meta.fields, tuple):
+#                form._meta.fields = list(form._meta.fields)
+#            form._meta.fields.append(self.fk.name)
+#
+#    def get_unique_error_message(self, unique_check):
+#        unique_check = [field for field in unique_check if field != self.fk.name]
+#        return super(BaseInlineDocumentFormSet, self).get_unique_error_message(unique_check)
+#
+#
+#def _get_rel_field(parent_document, model, rel_name=None, can_fail=False):
+#    """
+#    Finds and returns the ForeignKey from model to parent if there is one
+#    (returns None if can_fail is True and no such field exists). If fk_name is
+#    provided, assume it is the name of the ForeignKey field. Unles can_fail is
+#    True, an exception is raised if there is no ForeignKey from model to
+#    parent_document.
+#    """
+#    #opts = model._meta
+#    fields = model._fields
+#    if rel_name:
+#        if rel_name not in fields:
+#            raise Exception("%s has no field named '%s'" % (model, rel_name))
+#        
+#        rel_model = getattr(model, rel_name, None)
+#        ref_field = fields.get(rel_name)
+#        if not isinstance(ref_field, ReferenceField) or \
+#                rel_model != parent_document:
+#            raise Exception("rel_name '%s' is not a reference to %s" % (rel_name, parent_document))    
+#    else:
+#        # Try to discover what the ForeignKey from model to parent_document is
+#        rel_to_parent = [
+#            f for f in fields
+#            if isinstance(f, ReferenceField)
+#            and getattr(model, f.name) == parent_document
+#        ]
+#        if len(rel_to_parent) == 1:
+#            ref_field = rel_to_parent[0]
+#        elif len(rel_to_parent) == 0:
+#            if can_fail:
+#                return
+#            raise Exception("%s has no relation to %s" % (model, parent_document))
+#        else:
+#            raise Exception("%s has more than 1 relation to %s" % (model, parent_document))
+#    return ref_field
+#
+#
+#def inlineformset_factory(parent_document, model, form=ModelForm,
+#                          formset=BaseInlineFormSet, fk_name=None,
+#                          fields=None, exclude=None, extra=3, can_order=False,
+#                          can_delete=True, max_num=None, formfield_callback=None,
+#                          widgets=None, validate_max=False, localized_fields=None):
+#    """
+#    Returns an ``InlineFormSet`` for the given kwargs.
+#
+#    You must provide ``fk_name`` if ``model`` has more than one ``ForeignKey``
+#    to ``parent_document``.
+#    """
+#    rel_field = _get_rel_field(parent_document, model, fk_name=fk_name)
+#    # You can't have more then reference in a ReferenceField
+#    # so max_num is always one for now (maybe 
+#    # ListFields(ReferenceFields) will be supported one day).
+#    max_num = 1
+#    kwargs = {
+#        'form': form,
+#        'formfield_callback': formfield_callback,
+#        'formset': formset,
+#        'extra': extra,
+#        'can_delete': can_delete,
+#        'can_order': can_order,
+#        'fields': fields,
+#        'exclude': exclude,
+#        'max_num': max_num,
+#        'widgets': widgets,
+#        'validate_max': validate_max,
+#        'localized_fields': localized_fields,
+#    }
+#    FormSet = documentformset_factory(model, **kwargs)
+#    FormSet.rel_field = rel_field
+#    return FormSet
+
+class EmbeddedDocumentFormSet(BaseDocumentFormSet):
+    def __init__(self, data=None, files=None, save_as_new=False, 
+                 prefix=None, queryset=[], parent_document=None, **kwargs):
         self.parent_document = parent_document
-        super(EmbeddedDocumentFormSet, self).__init__(data, files, instance, save_as_new, prefix, queryset, **kwargs)
+        super(EmbeddedDocumentFormSet, self).__init__(data, files, save_as_new, prefix, queryset, **kwargs)
         
     def _construct_form(self, i, **kwargs):
         defaults = {'parent_document': self.parent_document}
+        
+        # add position argument to the form. Otherwise we will spend
+        # a huge amount of time iterating over the list field on form __init__
+        emb_list = getattr(self.parent_document, self.form._meta.embedded_field)
+        if len(emb_list) < i:
+            defaults['position'] = i
         defaults.update(kwargs)
-        form = super(BaseDocumentFormSet, self)._construct_form(i, **defaults)
+        
+        form = super(EmbeddedDocumentFormSet, self)._construct_form(i, **defaults)
         return form
+
+    @property
+    def empty_form(self):
+        form = self.form(
+            self.parent_document,
+            auto_id=self.auto_id,
+            prefix=self.add_prefix('__prefix__'),
+            empty_permitted=True,
+        )
+        self.add_fields(form, None)
+        return form
+    
+    def save(self, commit=True):
+        # Don't try to save the new documents. Embedded objects don't have
+        # a save method anyway.
+        objs = super(EmbeddedDocumentFormSet, self).save(commit=False)
+        
+        if commit and self.parent_document is not None:
+            form = self.empty_form
+            # The thing about formsets is that the base use case is to edit *all*
+            # of the associated objects on a model. As written, using these FormSets this
+            # way will cause the existing embedded documents to get saved along with a
+            # copy of themselves plus any new ones you added.
+            #
+            # The only way you could do "updates" of existing embedded document fields is
+            # if those embedded documents had ObjectIDs of their own, which they don't
+            # by default in Mongoengine.
+            #
+            # In this case it makes the most sense to simply replace the embedded field
+            # with the new values gathered form the formset, rather than adding the new
+            # values to the existing values, because the new values will almost always
+            # contain the old values (with the default use case.)
+            #
+            # attr_data = getattr(self.parent_document, form._meta.embedded_field, [])
+            setattr(self.parent_document, form._meta.embedded_field, objs or [])
+            self.parent_document.save()
+        
+        return objs 
+
 
 def embeddedformset_factory(document, parent_document, form=EmbeddedDocumentForm,
                           formset=EmbeddedDocumentFormSet,
@@ -681,6 +1010,5 @@ def embeddedformset_factory(document, parent_document, form=EmbeddedDocumentForm
         'exclude': exclude,
         'max_num': max_num,
     }
-    FormSet = inlineformset_factory(document, **kwargs)
-    FormSet.parent_document = parent_document
+    FormSet = documentformset_factory(document, **kwargs)
     return FormSet

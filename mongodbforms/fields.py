@@ -6,9 +6,24 @@ Wilson Júnior (wilsonpjunior@gmail.com).
 """
 
 from django import forms
-from django.core.validators import EMPTY_VALUES
-from django.utils.encoding import smart_unicode, force_unicode
+from django.core.validators import EMPTY_VALUES, MinLengthValidator, MaxLengthValidator
+
+try:
+    from django.utils.encoding import force_text as force_unicode
+except ImportError:
+    from django.utils.encoding import force_unicode
+    
+try:
+    from django.utils.encoding import smart_text as smart_unicode
+except ImportError:
+    try:
+        from django.utils.encoding import smart_unicode
+    except ImportError:
+        from django.forms.util import smart_unicode
+        
 from django.utils.translation import ugettext_lazy as _
+from django.forms.util import ErrorList
+from django.core.exceptions import ValidationError
 
 try:  # objectid was moved into bson in pymongo 1.9
     from bson.objectid import ObjectId
@@ -16,6 +31,8 @@ try:  # objectid was moved into bson in pymongo 1.9
 except ImportError:
     from pymongo.objectid import ObjectId
     from pymongo.errors import InvalidId
+    
+from .widgets import ListWidget, MapWidget
 
 class MongoChoiceIterator(object):
     def __init__(self, field):
@@ -24,7 +41,7 @@ class MongoChoiceIterator(object):
 
     def __iter__(self):
         if self.field.empty_label is not None:
-            yield (u"", self.field.empty_label)
+            yield ("", self.field.empty_label)
 
         for obj in self.queryset.all():
             yield self.choice(obj)
@@ -45,7 +62,7 @@ class ReferenceField(forms.ChoiceField):
     """
     Reference field for mongo forms. Inspired by `django.forms.models.ModelChoiceField`.
     """
-    def __init__(self, queryset, empty_label=u"---------",
+    def __init__(self, queryset, empty_label="---------",
                  *aargs, **kwaargs):
 
         forms.Field.__init__(self, *aargs, **kwaargs)
@@ -81,8 +98,14 @@ class ReferenceField(forms.ChoiceField):
         return smart_unicode(obj)
 
     def clean(self, value):
-        if value in EMPTY_VALUES and not self.required:
-            return None
+        # Check for empty values. 
+        if value in EMPTY_VALUES:
+            # Raise exception if it's empty and required.
+            if self.required:
+                raise forms.ValidationError(self.error_messages['required'])
+            # If it's not required just ignore it.
+            else:
+                return None
 
         try:
             oid = ObjectId(value)
@@ -109,10 +132,10 @@ class DocumentMultipleChoiceField(ReferenceField):
     widget = forms.SelectMultiple
     hidden_widget = forms.MultipleHiddenInput
     default_error_messages = {
-        'list': _(u'Enter a list of values.'),
-        'invalid_choice': _(u'Select a valid choice. %s is not one of the'
-                            u' available choices.'),
-        'invalid_pk_value': _(u'"%s" is not a valid value for a primary key.')
+        'list': _('Enter a list of values.'),
+        'invalid_choice': _('Select a valid choice. %s is not one of the'
+                            ' available choices.'),
+        'invalid_pk_value': _('"%s" is not a valid value for a primary key.')
     }
 
     def __init__(self, queryset, *args, **kwargs):
@@ -125,17 +148,18 @@ class DocumentMultipleChoiceField(ReferenceField):
             return []
         if not isinstance(value, (list, tuple)):
             raise forms.ValidationError(self.error_messages['list'])
+        
         key = 'pk'
-
-        filter_ids = []
-        for pk in value:
-            try:
-                oid = ObjectId(pk)
-                filter_ids.append(oid)
-            except InvalidId:
-                raise forms.ValidationError(self.error_messages['invalid_pk_value'] % pk)
+#        filter_ids = []
+#        for pk in value:
+#            filter_ids.append(pk)
+#            try:
+#                oid = ObjectId(pk)
+#                filter_ids.append(oid)
+#            except InvalidId:
+#                raise forms.ValidationError(self.error_messages['invalid_pk_value'] % pk)
         qs = self.queryset.clone()
-        qs = qs.filter(**{'%s__in' % key: filter_ids})
+        qs = qs.filter(**{'%s__in' % key: value})
         pks = set([force_unicode(getattr(o, key)) for o in qs])
         for val in value:
             if force_unicode(val) not in pks:
@@ -149,3 +173,225 @@ class DocumentMultipleChoiceField(ReferenceField):
         if hasattr(value, '__iter__') and not hasattr(value, '_meta'):
             return [super(DocumentMultipleChoiceField, self).prepare_value(v) for v in value]
         return super(DocumentMultipleChoiceField, self).prepare_value(value)
+    
+    
+class ListField(forms.Field):
+    """
+    A Field that aggregates the logic of multiple Fields.
+
+    Its clean() method takes a "decompressed" list of values, which are then
+    cleaned into a single value according to self.fields. Each value in
+    this list is cleaned by the corresponding field -- the first value is
+    cleaned by the first field, the second value is cleaned by the second
+    field, etc. Once all fields are cleaned, the list of clean values is
+    "compressed" into a single value.
+
+    Subclasses should not have to implement clean(). Instead, they must
+    implement compress(), which takes a list of valid values and returns a
+    "compressed" version of those values -- a single value.
+
+    You'll probably want to use this with MultiWidget.
+    """
+    default_error_messages = {
+        'invalid': _('Enter a list of values.'),
+    }
+    widget = ListWidget
+
+    def __init__(self, field_type, *args, **kwargs):
+        self.field_type = field_type
+        widget = self.field_type().widget
+        if isinstance(widget, type):
+            w_type = widget
+        else:
+            w_type = widget.__class__
+        self.widget = self.widget(w_type)
+        
+        super(ListField, self).__init__(*args, **kwargs)
+        
+        if not hasattr(self, 'empty_values'):
+            self.empty_values = list(EMPTY_VALUES)
+
+    def validate(self, value):
+        pass
+
+    def clean(self, value):
+        """
+        Validates every value in the given list. A value is validated against
+        the corresponding Field in self.fields.
+
+        For example, if this MultiValueField was instantiated with
+        fields=(DateField(), TimeField()), clean() would call
+        DateField.clean(value[0]) and TimeField.clean(value[1]).
+        """
+        clean_data = []
+        errors = ErrorList()
+        if not value or isinstance(value, (list, tuple)):
+            if not value or not [v for v in value if v not in self.empty_values]:
+                if self.required:
+                    raise ValidationError(self.error_messages['required'])
+                else:
+                    return []
+        else:
+            raise ValidationError(self.error_messages['invalid'])
+        
+        field = self.field_type(required=self.required)
+        for field_value in value:
+            try:
+                clean_data.append(field.clean(field_value))
+            except ValidationError as e:
+                # Collect all validation errors in a single list, which we'll
+                # raise at the end of clean(), rather than raising a single
+                # exception for the first error we encounter.
+                errors.extend(e.messages)
+            if field.required:
+                field.required = False
+        if errors:
+            raise ValidationError(errors)
+
+        self.validate(clean_data)
+        self.run_validators(clean_data)
+        return clean_data
+
+    def _has_changed(self, initial, data):
+        if initial is None:
+            initial = ['' for x in range(0, len(data))]
+        
+        field = self.field_type(required=self.required) 
+        for initial, data in zip(initial, data):
+            if field._has_changed(initial, data):
+                return True
+        return False
+
+class MapField(forms.Field):
+    default_error_messages = {
+        'invalid': _('Enter a list of values.'),
+        'key_required': _('A key is required.'),
+    }
+    widget = MapWidget
+
+    def __init__(self, field_type, max_key_length=None, min_key_length=None, 
+                 key_validators=[], field_kwargs={}, *args, **kwargs):
+        
+        widget = field_type().widget
+        if isinstance(widget, type):
+            w_type = widget
+        else:
+            w_type = widget.__class__
+        self.widget = self.widget(w_type)
+        
+        super(MapField, self).__init__(*args, **kwargs)
+        
+        self.key_validators = key_validators
+        if min_key_length is not None:
+            self.key_validators.append(MinLengthValidator(int(min_key_length)))
+        if max_key_length is not None:
+            self.key_validators.append(MaxLengthValidator(int(max_key_length)))
+        
+        # type of field used to store the dicts value
+        self.field_type = field_type
+        field_kwargs['required'] = self.required
+        self.field_kwargs = field_kwargs
+        
+        if not hasattr(self, 'empty_values'):
+            self.empty_values = list(EMPTY_VALUES)
+
+    def _validate_key(self, key):
+        if key in self.empty_values and self.required:
+            raise ValidationError(self.error_messages['key_required'], code='key_required')
+        errors = []
+        for v in self.key_validators:
+            try:
+                v(key)
+            except ValidationError as e:
+                if hasattr(e, 'code'):
+                    code = 'key_%s' % e.code
+                    if code in self.error_messages:
+                        e.message = self.error_messages[e.code]
+                errors.extend(e.error_list)
+        if errors:
+            raise ValidationError(errors)
+
+    def validate(self, value):
+        pass
+
+    def clean(self, value):
+        """
+        Validates every value in the given list. A value is validated against
+        the corresponding Field in self.fields.
+
+        For example, if this MultiValueField was instantiated with
+        fields=(DateField(), TimeField()), clean() would call
+        DateField.clean(value[0]) and TimeField.clean(value[1]).
+        """
+        clean_data = {}
+        errors = ErrorList()
+        if not value or isinstance(value, dict):
+            if not value or not [v for v in value.values() if v not in self.empty_values]:
+                if self.required:
+                    raise ValidationError(self.error_messages['required'])
+                else:
+                    return {}
+        else:
+            raise ValidationError(self.error_messages['invalid'])
+        
+        # sort out required => at least one element must be in there
+        
+        data_field = self.field_type(**self.field_kwargs)
+        for key, val in value.items():
+            # ignore empties. Can they even come up here?
+            if key in self.empty_values and val in self.empty_values:
+                continue
+            
+            try:
+                val = data_field.clean(val)
+            except ValidationError as e:
+                # Collect all validation errors in a single list, which we'll
+                # raise at the end of clean(), rather than raising a single
+                # exception for the first error we encounter.
+                errors.extend(e.messages)
+                
+            try:
+                self._validate_key(key)
+            except ValidationError as e:
+                # Collect all validation errors in a single list, which we'll
+                # raise at the end of clean(), rather than raising a single
+                # exception for the first error we encounter.
+                errors.extend(e.messages)
+            
+            clean_data[key] = val
+                
+            if data_field.required:
+                data_field.required = False
+                
+        if errors:
+            raise ValidationError(errors)
+
+        self.validate(clean_data)
+        self.run_validators(clean_data)
+        return clean_data
+
+    def _has_changed(self, initial, data):
+        field = self.field_type(**self.field_kwargs)
+        for k, v in data.items():
+            if initial is None:
+                init_val = ''
+            else:
+                try:
+                    init_val = initial[k]
+                except KeyError:
+                    return True
+            if field._has_changed(init_val, v):
+                return True
+        return False
+
+
+
+
+
+
+
+
+
+
+
+

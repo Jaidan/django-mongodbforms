@@ -7,18 +7,30 @@ Wilson Júnior (wilsonpjunior@gmail.com).
 
 from django import forms
 from django.core.validators import EMPTY_VALUES
-from django.utils.encoding import smart_unicode
+try:
+    from django.utils.encoding import smart_text as smart_unicode
+except ImportError:
+    try:
+        from django.utils.encoding import smart_unicode
+    except ImportError:
+        from django.forms.util import smart_unicode
 from django.db.models.options import get_verbose_name
 from django.utils.text import capfirst
 
-from mongoengine import ReferenceField as MongoReferenceField
+from mongoengine import ReferenceField as MongoReferenceField, EmbeddedDocumentField as MongoEmbeddedDocumentField
 
-from fields import MongoCharField, ReferenceField, DocumentMultipleChoiceField
+from .fields import MongoCharField, ReferenceField, DocumentMultipleChoiceField, ListField, MapField
 
 BLANK_CHOICE_DASH = [("", "---------")]
 
 class MongoFormFieldGenerator(object):
     """This class generates Django form-fields for mongoengine-fields."""
+    
+    # used for fields that fit in one of the generate functions
+    # but don't actually have the name.
+    field_map = {
+        'sortedlistfield': 'generate_listfield',
+    }
 
     def generate(self, field, **kwargs):
         """Tries to lookup a matching formfield generator (lowercase
@@ -31,11 +43,14 @@ class MongoFormFieldGenerator(object):
 
         for cls in field.__class__.__bases__:
             cls_name = cls.__name__.lower()
-            if hasattr(self, 'generate_%s' % cls_name):
+            try:
                 return getattr(self, 'generate_%s' % cls_name)(field, **kwargs)
-
-        raise NotImplementedError('%s is not supported by MongoForm' % \
-                                          field.__class__.__name__)
+            except AttributeError:
+                if cls_name in self.field_map:
+                    return getattr(self, self.field_map.get(cls_name))(field, **kwargs)
+                else:
+                    raise NotImplementedError('%s is not supported by MongoForm' % \
+                                field.__class__.__name__)
 
     def get_field_choices(self, field, include_blank=True,
                           blank_choice=BLANK_CHOICE_DASH):
@@ -60,7 +75,9 @@ class MongoFormFieldGenerator(object):
     def get_field_label(self, field):
         if field.verbose_name:
             return field.verbose_name
-        return capfirst(get_verbose_name(field.name))
+        if field.name is not None:
+            return capfirst(get_verbose_name(field.name))
+        return ''
 
     def get_field_help_text(self, field):
         if field.help_text:
@@ -239,6 +256,27 @@ class MongoFormFieldGenerator(object):
             defaults.update(kwargs)
             f = DocumentMultipleChoiceField(field.field.document_type.objects, **defaults)
             return f
+        elif not isinstance(field.field, MongoEmbeddedDocumentField):
+            defaults = {
+                'label': self.get_field_label(field),
+                'help_text': self.get_field_help_text(field),
+                'required': field.required,
+                #'initial': getattr(field._owner_document, field.name, [])
+            }
+            defaults.update(kwargs)
+            # figure out which type of field is stored in the list
+            form_field = self.generate(field.field)
+            return ListField(form_field.__class__, **defaults)
+        
+    def generate_mapfield(self, field, **kwargs):
+        defaults = {
+            'label': self.get_field_label(field),
+            'help_text': self.get_field_help_text(field),
+            'required': field.required
+        }
+        defaults.update(kwargs)
+        form_field = self.generate(field.field)
+        return MapField(form_field.__class__, **defaults)
 
     def generate_filefield(self, field, **kwargs):
         defaults = {
